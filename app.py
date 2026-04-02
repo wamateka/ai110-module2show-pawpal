@@ -366,6 +366,13 @@ with nav_schedule:
                     key="sched_sort_mode",
                 )
 
+            _SORT_DESCRIPTIONS = {
+                "urgency":          "Overdue tasks surface first, then sorted by scheduled date.",
+                "care score":       "Pets with the lowest overall care score are prioritised.",
+                "completion gap":   "Pets furthest from meeting today's targets appear first.",
+            }
+            st.info(f"**Sort mode — {sort_mode.title()}:** {_SORT_DESCRIPTIONS[sort_mode]}")
+
             # Resolve active pet IDs: multiselect → name search refinement
             base_ids = filter_pets if filter_pets else all_pet_ids
             if name_search.strip():
@@ -404,9 +411,26 @@ with nav_schedule:
             # ── Conflict banner ───────────────────────────────────────────
             conflicts = ts.detect_conflicts(pet_ids=active_pet_ids, window_days=7)
             if conflicts:
-                with st.expander(f"⚠️ {len(conflicts)} conflict(s) in next 7 days", expanded=True):
+                _conflict_cfg = {
+                    "daily_overload":        ("🚨", "error",   "Daily Overload"),
+                    "duplicate_non_feeding": ("⚠️", "warning", "Duplicate Task"),
+                    "time_proximity":        ("🕐", "warning", "Time Overlap"),
+                    "cross_pet_time_clash":  ("🐾", "warning", "Cross-Pet Clash"),
+                }
+                with st.expander(f"⚠️ {len(conflicts)} scheduling conflict(s) in the next 7 days", expanded=True):
                     for c in conflicts:
-                        st.warning(c.message)
+                        icon, level, label = _conflict_cfg.get(
+                            c.conflict_type, ("ℹ️", "info", c.conflict_type)
+                        )
+                        msg = f"{icon} **{label}** — {c.message}"
+                        if level == "error":
+                            st.error(msg)
+                        elif level == "warning":
+                            st.warning(msg)
+                        else:
+                            st.info(msg)
+            else:
+                st.success("No scheduling conflicts in the next 7 days.")
 
             # ── Task list ─────────────────────────────────────────────────
             today = date.today()
@@ -419,12 +443,16 @@ with nav_schedule:
                 days_diff = (task.scheduled_date - today).days
                 if days_diff < 0:
                     urgency_badge = f"🔴 {abs(days_diff)}d overdue"
+                    urgency_level = "overdue"
                 elif days_diff == 0:
-                    urgency_badge = "🟡 Today"
+                    urgency_badge = "🟡 Due today"
+                    urgency_level = "today"
                 elif days_diff <= 3:
                     urgency_badge = f"🟢 In {days_diff}d"
+                    urgency_level = "soon"
                 else:
                     urgency_badge = f"⚪ In {days_diff}d"
+                    urgency_level = "future"
 
                 status_icon  = {"pending": "⏳", "done": "✅", "skipped": "⏭️"}.get(task.status, "")
                 recur_labels = {"daily": "↻ Daily", "weekly": "↻ Weekly",
@@ -433,39 +461,47 @@ with nav_schedule:
                 time_str     = f" @ {task.scheduled_time}" if task.scheduled_time else ""
                 pet_name     = pet_id_to_name.get(task.pet_id, task.pet_id)
 
-                col_info, col_actions = st.columns([4, 1])
-                with col_info:
-                    line = (
-                        f"{status_icon} **{task.task_type.replace('_', ' ').title()}** — "
-                        f"{pet_name} · {task.scheduled_date}{time_str} &nbsp; {urgency_badge}"
-                    )
-                    if recur_label:
-                        line += f" &nbsp; `{recur_label}`"
-                    if task.notes:
-                        line += f"  \n_{task.notes}_"
-                    st.markdown(line)
+                with st.container(border=True):
+                    col_info, col_actions = st.columns([4, 1])
+                    with col_info:
+                        header = (
+                            f"{status_icon} **{task.task_type.replace('_', ' ').title()}** — "
+                            f"{pet_name} · {task.scheduled_date}{time_str}"
+                        )
+                        if recur_label:
+                            header += f" &nbsp; `{recur_label}`"
+                        st.markdown(header)
+                        if task.notes:
+                            st.caption(f"📝 {task.notes}")
+                        # Urgency callout
+                        if urgency_level == "overdue":
+                            st.error(urgency_badge)
+                        elif urgency_level == "today":
+                            st.warning(urgency_badge)
+                        elif urgency_level == "soon":
+                            st.info(urgency_badge)
+                        else:
+                            st.success(urgency_badge)
 
-                with col_actions:
-                    if task.status == "pending":
-                        c_done, c_skip = st.columns(2)
-                        with c_done:
-                            if st.button("✓", key=f"sched_done_{task.id}", help="Mark done"):
-                                next_task = ts.complete(task.id)
-                                msg = "✅ Marked done."
-                                if next_task:
-                                    msg += f" Next: {next_task.scheduled_date}"
-                                st.success(msg)
-                                st.rerun()
-                        with c_skip:
-                            if st.button("⏭", key=f"sched_skip_{task.id}", help="Skip"):
-                                next_task = ts.skip(task.id)
-                                msg = "⏭️ Skipped."
-                                if next_task:
-                                    msg += f" Next: {next_task.scheduled_date}"
-                                st.info(msg)
-                                st.rerun()
-
-                st.divider()
+                    with col_actions:
+                        if task.status == "pending":
+                            c_done, c_skip = st.columns(2)
+                            with c_done:
+                                if st.button("✓", key=f"sched_done_{task.id}", help="Mark done"):
+                                    next_task = ts.complete(task.id)
+                                    msg = "✅ Marked done."
+                                    if next_task:
+                                        msg += f" Next: {next_task.scheduled_date}"
+                                    st.success(msg)
+                                    st.rerun()
+                            with c_skip:
+                                if st.button("⏭", key=f"sched_skip_{task.id}", help="Skip"):
+                                    next_task = ts.skip(task.id)
+                                    msg = "⏭️ Skipped."
+                                    if next_task:
+                                        msg += f" Next: {next_task.scheduled_date}"
+                                    st.info(msg)
+                                    st.rerun()
 
             # ── Add task form ─────────────────────────────────────────────
             with st.expander("➕ Schedule New Task"):
@@ -572,6 +608,33 @@ with nav_schedule:
             st.markdown(f"**{len(rows)}** target(s) matching filters")
 
             if rows:
-                st.dataframe(rows, use_container_width=True)
+                # Split into achieved vs pending for a summary header
+                n_achieved = sum(1 for r in rows if r["Status"] == "achieved")
+                n_pending  = sum(1 for r in rows if r["Status"] == "pending")
+                if n_achieved:
+                    st.success(f"✅ {n_achieved} pet(s) have met their care targets.")
+                if n_pending:
+                    st.warning(f"⏳ {n_pending} pet(s) still have pending targets.")
+
+                # Render each target as a bordered card with status-appropriate callout
+                for r in rows:
+                    with st.container(border=True):
+                        col_name, col_stats = st.columns([2, 5])
+                        with col_name:
+                            st.markdown(f"**{r['Pet']}**")
+                            if r["Status"] == "achieved":
+                                st.success("✅ Achieved")
+                            elif r["Status"] == "pending":
+                                st.warning("⏳ Pending")
+                            else:
+                                st.info("— No targets set")
+                        with col_stats:
+                            if r["Status"] != "—":
+                                st.table({
+                                    "Meals / day":    [r["Meals / day"]],
+                                    "Walk (min/day)": [r["Walk (min/day)"]],
+                                    "Groom (days)":   [r["Groom (days)"]],
+                                    "Vet (days)":     [r["Vet (days)"]],
+                                })
             else:
                 st.info("No care targets match the current filters.")

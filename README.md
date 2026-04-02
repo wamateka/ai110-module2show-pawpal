@@ -1,70 +1,105 @@
-# PawPal+ (Module 2 Project)
+# PawPal+
 
-You are building **PawPal+**, a Streamlit app that helps a pet owner plan care tasks for their pet.
+> A smart pet care scheduling app built with Python and Streamlit.
 
-## Scenario
-
-A busy pet owner needs help staying consistent with pet care. They want an assistant that can:
-
-- Track pet care tasks (walks, feeding, meds, enrichment, grooming, etc.)
-- Consider constraints (time available, priority, owner preferences)
-- Produce a daily plan and explain why it chose that plan
-
-Your job is to design the system first (UML), then implement the logic in Python, then connect it to the Streamlit UI.
-
-## What you will build
-
-Your final app should:
-
-- Let a user enter basic owner + pet info
-- Let a user add/edit tasks (duration + priority at minimum)
-- Generate a daily schedule/plan based on constraints and priorities
-- Display the plan clearly (and ideally explain the reasoning)
-- Include tests for the most important scheduling behaviors
-
-## Smarter Scheduling
-
-PawPal+ goes beyond a basic task list with three scheduling improvements built into `pawpal_system.py`.
-
-**Task sorting** — tasks can be ordered three ways depending on what the owner cares about most: by *urgency* (overdue tasks surface first, then ascending by date), by *care score* (pets with the lowest overall score get attention first), or by *completion gap* (pets furthest from meeting their daily targets are prioritized). All three strategies are pure functions that accept any task list and return a sorted copy, making them easy to compose with filters.
-
-**Status and pet filtering** — `TaskService.get_all_for_pets()` accepts an optional `status` argument (`pending`, `done`, `skipped`) and an arbitrary list of pet IDs, so the UI can slice the task list by a single pet, a species group, or a completion state without loading everything into memory first.
-
-**Recurring task automation** — marking a recurring task done or skipped automatically spawns the next occurrence (linked via `parent_task_id`), so daily walks and weekly grooming sessions regenerate themselves without manual re-entry. Custom intervals are supported alongside `daily` and `weekly`.
-
-**Target auto-reset** — care targets can be given a `reset_period` of `daily` or `weekly`. Once a target is marked achieved, calling `check_and_reset()` (or the bulk `check_and_reset_all()`) on the next qualifying day flips it back to `pending` automatically, keeping recurring goals like daily feeding quotas in sync with the calendar.
-
-**Conflict detection** — `TaskService.detect_conflicts()` scans a configurable day window for four problem patterns: the same non-feeding task type scheduled twice for one pet on the same day, two timed tasks within 30 minutes of each other for the same pet, more than six tasks in one day for a single pet, and — new in this iteration — tasks for *different* pets booked at the exact same time, flagging situations where a solo owner physically cannot be in two places at once. All conflicts return structured `ConflictReport` objects with a plain-English message rather than raising exceptions.
-
-## Testing PawPal+
-
-### Run the test suite
-
-```bash
-python -m pytest tests/test_pawpal.py -v
-```
-
-### What the tests cover
-
-The suite contains **35 tests** across five areas:
-
-| Area | What is verified |
-|---|---|
-| **Sorting** | Tasks return in chronological order; overdue tasks surface first; lowest care-score and largest completion-gap pets are prioritized correctly |
-| **Recurrence** | Completing or skipping a daily/weekly/custom task spawns the next occurrence on the right date, linked via `parent_task_id`; one-off tasks do not spawn successors |
-| **Conflict detection** | Duplicate non-feeding tasks on the same day are flagged; tasks scheduled fewer than 30 minutes apart trigger a time-proximity warning; more than 6 tasks on one day raises a daily-overload alert; the 30-minute boundary is tested to confirm it is not off-by-one |
-| **Care score calculation** | Feeding, exercise, grooming, and vet percentages compute correctly against targets; scores cap at 100%; overdue grooming scores zero; grades (A/B/C/D) match their threshold; recalculating the same date updates the record in place instead of duplicating it |
-| **Care target reset** | Daily targets reset after 1 day and weekly targets after 7 days; targets that have not yet elapsed or were never achieved are left untouched; the bulk `check_and_reset_all()` resets every qualifying pet in one call |
-
-### Confidence level
-
-**4 / 5 stars**
-
-All 35 tests pass and the critical paths — sorting, recurrence spawning, conflict rules, score math, and target resets — are verified including their boundary conditions. One star is held back because the services use in-memory class-level dicts rather than a real database, so persistence bugs (concurrent writes, data surviving between app restarts) cannot be caught by this suite alone.
+PawPal+ helps pet owners stay consistent with daily care routines. It tracks tasks like feeding, walks, grooming, and vet visits — then applies scheduling algorithms to surface the most urgent work first, detect conflicts before they happen, and keep recurring goals in sync automatically.
 
 ---
 
-## Getting started
+## Screenshots
+
+### Pet Dashboard
+![Pet profile dashboard showing species, breed, weight, and age alongside tabs for Care Targets, Log Activity, and Care Score](image.png)
+
+### Care Score & History
+![Care score breakdown showing Overall 38/100 Grade D, with Feeding 50%, Exercise 100%, Grooming 0%, Vet 0%, and a 30-day score history line chart](Screenshot%202026-04-02%20014051.png)
+
+### System Design — UML Class Diagram
+![UML class diagram showing all data models and service classes with their relationships and dependencies](Screenshot%202026-04-02%20014534.png)
+
+---
+
+## Features
+
+### Multi-Pet Owner Support
+Register and log in securely (SHA-256 password hashing). Each account manages an unlimited number of pets, each with its own profile, care targets, activity log, and score history.
+
+### Care Target Tracking
+Set per-pet daily and interval-based targets across four care categories — meals per day, walk minutes per day, grooming interval (days), and vet visit interval (days). Targets start as `pending` and can be marked `achieved` when met.
+
+### Care Target Auto-Reset
+Targets can be configured with a `reset_period` of `daily` or `weekly`. Once achieved, `check_and_reset()` automatically flips the status back to `pending` when the qualifying time has elapsed — keeping recurring goals like daily feeding quotas in sync with the calendar without manual intervention.
+
+### Activity Logging with Backdating
+Log any care activity — feeding, walk, grooming, or vet visit — for any date (past or present). Walk entries capture duration in minutes. All logged activities feed directly into care score calculations.
+
+### Care Score Calculation (A–D Grade)
+`CareScoreService.calculate()` computes four independent percentages against the pet's targets for a given date:
+
+| Metric | Algorithm |
+|---|---|
+| **Feeding** | `min(100, meals_logged / daily_meals × 100)` |
+| **Exercise** | `min(100, walk_minutes_logged / daily_walk_min × 100)` |
+| **Grooming** | `100` if most recent grooming is within `grooming_interval_days`, else `0` |
+| **Vet** | `100` if most recent vet visit is within `vet_interval_days`, else `0` |
+
+The overall score is the average of all four, graded A (≥90), B (≥80), C (≥70), or D (<70). Calling calculate twice for the same pet and date upserts in place — no duplicate records.
+
+### Three Task Sorting Strategies
+Tasks can be sorted by any of three pure functions, each returning a new sorted list:
+
+| Strategy | Behaviour |
+|---|---|
+| **Urgency** | Overdue tasks surface first, then ascending by scheduled date |
+| **Care Score** | Pets with the lowest overall care score are prioritised |
+| **Completion Gap** | Pets furthest from meeting today's targets appear first |
+
+All three strategies are stateless pure functions — they accept any task list and are independently composable with status and pet filters.
+
+### Recurring Task Automation
+Marking a task `done` or `skipped` automatically spawns the next occurrence at the correct future date. Three recurrence modes are supported:
+
+- `daily` — next occurrence in 1 day
+- `weekly` — next occurrence in 7 days
+- `custom` — next occurrence in a user-defined number of days
+
+Each spawned task is linked back to its origin via `parent_task_id`, creating a full recurrence chain without requiring manual re-entry.
+
+### Conflict Detection (4 Rules)
+`TaskService.detect_conflicts()` scans a configurable day window (default 7 days) and returns structured `ConflictReport` objects — never raises exceptions — for four conflict patterns:
+
+| Rule | Conflict Type | Condition |
+|---|---|---|
+| A | `duplicate_non_feeding` | Same non-feeding task type, same pet, same day |
+| B | `time_proximity` | Two timed tasks fewer than 30 minutes apart, same pet, same day |
+| C | `daily_overload` | More than 6 pending tasks for one pet on the same day |
+| D | `cross_pet_time_clash` | Tasks for different pets booked at the exact same time |
+
+Each report includes a plain-English message, the conflict type, and both task IDs so the UI can link directly to the offending tasks.
+
+### Status and Pet Filtering
+`TaskService.get_all_for_pets()` accepts an optional status filter (`pending`, `done`, `skipped`) and an arbitrary list of pet IDs. The Schedule view combines this with a name-search input and the three sort strategies to let owners slice their task list in any combination without loading unnecessary data.
+
+---
+
+## Project Structure
+
+```
+pawpal_system.py   — All data models, services, and sorting algorithms
+app.py             — Streamlit UI
+tests/
+  test_pawpal.py   — 35-test pytest suite
+reflection.md      — Design decisions, UML diagram, and AI collaboration notes
+```
+
+---
+
+## Getting Started
+
+### Requirements
+
+- Python 3.10+
+- pip
 
 ### Setup
 
@@ -74,12 +109,34 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Suggested workflow
+### Run the app
 
-1. Read the scenario carefully and identify requirements and edge cases.
-2. Draft a UML diagram (classes, attributes, methods, relationships).
-3. Convert UML into Python class stubs (no logic yet).
-4. Implement scheduling logic in small increments.
-5. Add tests to verify key behaviors.
-6. Connect your logic to the Streamlit UI in `app.py`.
-7. Refine UML so it matches what you actually built.
+```bash
+streamlit run app.py
+```
+
+---
+
+## Testing
+
+```bash
+python -m pytest tests/test_pawpal.py -v
+```
+
+**35 tests across 5 areas:**
+
+| Area | What is verified |
+|---|---|
+| **Sorting** | Chronological order, overdue-first, care score priority, completion gap priority |
+| **Recurrence** | Daily / weekly / custom spawning on correct date; skip also spawns; one-off tasks return `None` |
+| **Conflict detection** | All 4 rules fire correctly; boundary cases (exactly 30 min apart, exactly 6 tasks) do not false-positive |
+| **Care score** | Percentages and grades correct; scores cap at 100%; overdue grooming scores 0; upsert updates in place |
+| **Target reset** | Daily resets after 1 day, weekly after 7; pending targets and same-day achieved targets are never touched |
+
+**Confidence level: 4 / 5** — All 35 tests pass including boundary conditions. One star withheld because in-memory storage means persistence bugs (concurrent writes, data across restarts) require integration tests against a real database to catch.
+
+---
+
+## Design
+
+The full UML class diagram and a record of every design decision — including what changed from the initial plan and why — is in [reflection.md](reflection.md).
