@@ -36,6 +36,34 @@ PawPal+ goes beyond a basic task list with three scheduling improvements built i
 
 **Conflict detection** — `TaskService.detect_conflicts()` scans a configurable day window for four problem patterns: the same non-feeding task type scheduled twice for one pet on the same day, two timed tasks within 30 minutes of each other for the same pet, more than six tasks in one day for a single pet, and — new in this iteration — tasks for *different* pets booked at the exact same time, flagging situations where a solo owner physically cannot be in two places at once. All conflicts return structured `ConflictReport` objects with a plain-English message rather than raising exceptions.
 
+## Testing PawPal+
+
+### Run the test suite
+
+```bash
+python -m pytest tests/test_pawpal.py -v
+```
+
+### What the tests cover
+
+The suite contains **35 tests** across five areas:
+
+| Area | What is verified |
+|---|---|
+| **Sorting** | Tasks return in chronological order; overdue tasks surface first; lowest care-score and largest completion-gap pets are prioritized correctly |
+| **Recurrence** | Completing or skipping a daily/weekly/custom task spawns the next occurrence on the right date, linked via `parent_task_id`; one-off tasks do not spawn successors |
+| **Conflict detection** | Duplicate non-feeding tasks on the same day are flagged; tasks scheduled fewer than 30 minutes apart trigger a time-proximity warning; more than 6 tasks on one day raises a daily-overload alert; the 30-minute boundary is tested to confirm it is not off-by-one |
+| **Care score calculation** | Feeding, exercise, grooming, and vet percentages compute correctly against targets; scores cap at 100%; overdue grooming scores zero; grades (A/B/C/D) match their threshold; recalculating the same date updates the record in place instead of duplicating it |
+| **Care target reset** | Daily targets reset after 1 day and weekly targets after 7 days; targets that have not yet elapsed or were never achieved are left untouched; the bulk `check_and_reset_all()` resets every qualifying pet in one call |
+
+### Confidence level
+
+**4 / 5 stars**
+
+All 35 tests pass and the critical paths — sorting, recurrence spawning, conflict rules, score math, and target resets — are verified including their boundary conditions. One star is held back because the services use in-memory class-level dicts rather than a real database, so persistence bugs (concurrent writes, data surviving between app restarts) cannot be caught by this suite alone.
+
+---
+
 ## Getting started
 
 ### Setup
