@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -40,6 +42,8 @@ class CareTarget:
     grooming_interval_days: int = 0
     vet_interval_days: int = 0
     status: str = "pending"           # "pending" | "achieved"
+    reset_period: str = "none"        # "none" | "daily" | "weekly" — auto-resets status
+    last_reset_date: Optional[date] = None
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -178,6 +182,10 @@ class PetService:
             k: v for k, v in CareTargetService._targets.items() if v.pet_id != pet_id
         }
 
+        TaskService._tasks = {
+            k: v for k, v in TaskService._tasks.items() if v.pet_id != pet_id
+        }
+
         del self._pets[pet_id]
 
 
@@ -191,6 +199,7 @@ class CareTargetService:
         daily_walk_min: int,
         grooming_interval_days: int,
         vet_interval_days: int,
+        reset_period: str = "none",
     ) -> CareTarget:
         """Upsert the single CareTarget for the given pet, updating in place if one already exists."""
         # Find existing target for this pet
@@ -206,6 +215,7 @@ class CareTargetService:
             existing.daily_walk_min = daily_walk_min
             existing.grooming_interval_days = grooming_interval_days
             existing.vet_interval_days = vet_interval_days
+            existing.reset_period = reset_period
             existing.updated_at = datetime.now()
             return existing
         else:
@@ -216,6 +226,7 @@ class CareTargetService:
                 daily_walk_min=daily_walk_min,
                 grooming_interval_days=grooming_interval_days,
                 vet_interval_days=vet_interval_days,
+                reset_period=reset_period,
                 created_at=datetime.now(),
                 updated_at=datetime.now()
             )
@@ -233,8 +244,45 @@ class CareTargetService:
         """Set the CareTarget status to 'achieved' for the given pet and return it."""
         target = self.get_targets(pet_id)
         target.status = "achieved"
+        target.last_reset_date = date.today()
         target.updated_at = datetime.now()
         return target
+
+    def check_and_reset(
+        self, pet_id: str, today: Optional[date] = None
+    ) -> Optional[CareTarget]:
+        """
+        If reset_period is set and enough time has passed since last_reset_date,
+        flip status back to 'pending'. Returns the target if reset happened, else None.
+        """
+        today = today or date.today()
+        target = self.get_targets(pet_id)
+        if target.reset_period == "none" or target.status != "achieved":
+            return None
+        last = target.last_reset_date or target.updated_at.date()
+        elapsed = (today - last).days
+        if target.reset_period == "daily" and elapsed >= 1:
+            target.status = "pending"
+            target.last_reset_date = today
+            target.updated_at = datetime.now()
+            return target
+        if target.reset_period == "weekly" and elapsed >= 7:
+            target.status = "pending"
+            target.last_reset_date = today
+            target.updated_at = datetime.now()
+            return target
+        return None
+
+    def check_and_reset_all(self, today: Optional[date] = None) -> list[CareTarget]:
+        """Run check_and_reset for every target that has a reset_period set."""
+        today = today or date.today()
+        return [
+            result
+            for target in self._targets.values()
+            if target.reset_period != "none"
+            for result in [self.check_and_reset(target.pet_id, today)]
+            if result is not None
+        ]
 
     def count_for_pet(self, pet_id: str) -> int:
         """Return the number of CareTarget records that exist for the given pet (0 or 1)."""
@@ -395,3 +443,267 @@ class CareScoreService:
             if s.pet_id == pet_id and s.date >= cutoff_date
         ]
         return sorted(scores, key=lambda s: s.date)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled Tasks
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScheduledTask:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    pet_id: str = ""
+    task_type: str = ""               # "feeding" | "walk" | "grooming" | "vet_visit"
+    scheduled_date: date = field(default_factory=date.today)
+    scheduled_time: Optional[str] = None   # "HH:MM" or None
+    recurrence: str = "none"              # "none" | "daily" | "weekly" | "custom"
+    recurrence_interval_days: int = 0     # used when recurrence == "custom"
+    status: str = "pending"               # "pending" | "done" | "skipped"
+    parent_task_id: Optional[str] = None  # links spawned task back to its origin
+    notes: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class ConflictReport:
+    task_id: str
+    conflict_type: str      # "duplicate_non_feeding" | "time_proximity" | "daily_overload"
+    conflicting_task_id: Optional[str]   # None for daily_overload
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Sorting helpers (pure functions — no storage dependency)
+# ---------------------------------------------------------------------------
+
+def sort_by_urgency(tasks: list[ScheduledTask], today: date) -> list[ScheduledTask]:
+    """Overdue tasks first, then ascending by scheduled_date."""
+    return sorted(tasks, key=lambda t: (t.scheduled_date - today).days)
+
+
+def sort_by_care_score(
+    tasks: list[ScheduledTask], score_map: dict[str, int]
+) -> list[ScheduledTask]:
+    """Pets with the lowest overall care score surface first; ties broken by urgency."""
+    today = date.today()
+    return sorted(
+        tasks,
+        key=lambda t: (score_map.get(t.pet_id, 50), (t.scheduled_date - today).days),
+    )
+
+
+def sort_by_completion_gap(
+    tasks: list[ScheduledTask], gap_map: dict[str, float]
+) -> list[ScheduledTask]:
+    """Pets furthest from meeting today's targets surface first (gap 0.0–1.0)."""
+    today = date.today()
+    return sorted(
+        tasks,
+        key=lambda t: (-(gap_map.get(t.pet_id, 0.5)), (t.scheduled_date - today).days),
+    )
+
+
+# ---------------------------------------------------------------------------
+# TaskService
+# ---------------------------------------------------------------------------
+
+class TaskService:
+    _tasks: dict[str, ScheduledTask] = {}
+
+    # ── CRUD ──────────────────────────────────────────────────────────────
+
+    def create(
+        self,
+        pet_id: str,
+        task_type: str,
+        scheduled_date: date,
+        scheduled_time: Optional[str] = None,
+        recurrence: str = "none",
+        recurrence_interval_days: int = 0,
+        notes: str = "",
+        parent_task_id: Optional[str] = None,
+    ) -> ScheduledTask:
+        """Persist and return a new ScheduledTask."""
+        task = ScheduledTask(
+            pet_id=pet_id,
+            task_type=task_type,
+            scheduled_date=scheduled_date,
+            scheduled_time=scheduled_time,
+            recurrence=recurrence,
+            recurrence_interval_days=recurrence_interval_days,
+            notes=notes,
+            parent_task_id=parent_task_id,
+        )
+        self._tasks[task.id] = task
+        return task
+
+    def complete(self, task_id: str) -> Optional[ScheduledTask]:
+        """Mark task done. Returns spawned next occurrence for recurring tasks, else None."""
+        task = self._get_or_raise(task_id)
+        task.status = "done"
+        if task.recurrence != "none":
+            return self._spawn_next(task)
+        return None
+
+    def skip(self, task_id: str) -> Optional[ScheduledTask]:
+        """Mark task skipped. Returns spawned next occurrence for recurring tasks, else None."""
+        task = self._get_or_raise(task_id)
+        task.status = "skipped"
+        if task.recurrence != "none":
+            return self._spawn_next(task)
+        return None
+
+    def get_all_for_pets(
+        self,
+        pet_ids: list[str],
+        status: Optional[str] = None,
+    ) -> list[ScheduledTask]:
+        """Return all tasks for the given pets, optionally filtered by status."""
+        tasks = [t for t in self._tasks.values() if t.pet_id in pet_ids]
+        if status is not None:
+            tasks = [t for t in tasks if t.status == status]
+        return tasks
+
+    def delete_for_pet(self, pet_id: str) -> None:
+        """Remove all tasks belonging to the given pet (called from PetService.delete cascade)."""
+        self._tasks = {k: v for k, v in self._tasks.items() if v.pet_id != pet_id}
+
+    # ── Conflict detection ────────────────────────────────────────────────
+
+    def detect_conflicts(
+        self, pet_ids: list[str], window_days: int = 7
+    ) -> list[ConflictReport]:
+        """
+        Return ConflictReports for pending tasks within the next window_days.
+
+        Three rules:
+          A. Same non-feeding task type, same pet, same day.
+          B. Two tasks with scheduled_time set whose times are < 30 min apart, same day.
+          C. More than 6 pending tasks for the same pet on the same day.
+        """
+        today = date.today()
+        cutoff = today + timedelta(days=window_days)
+        pending = [
+            t for t in self._tasks.values()
+            if t.status == "pending"
+            and t.pet_id in pet_ids
+            and today <= t.scheduled_date <= cutoff
+        ]
+
+        reports: list[ConflictReport] = []
+        seen_pairs: set[frozenset] = set()
+
+        # Rules A & B — pairwise checks within same pet + same day
+        by_day: dict = defaultdict(list)
+        for t in pending:
+            by_day[(t.pet_id, t.scheduled_date)].append(t)
+
+        for group in by_day.values():
+            for i, a in enumerate(group):
+                for b in group[i + 1:]:
+                    pair = frozenset({a.id, b.id})
+                    if pair in seen_pairs:
+                        continue
+                    # Rule A
+                    if a.task_type == b.task_type and a.task_type != "feeding":
+                        reports.append(ConflictReport(
+                            task_id=a.id,
+                            conflict_type="duplicate_non_feeding",
+                            conflicting_task_id=b.id,
+                            message=(
+                                f"'{a.task_type}' scheduled twice on {a.scheduled_date} "
+                                f"for the same pet."
+                            ),
+                        ))
+                        seen_pairs.add(pair)
+                        continue
+                    # Rule B
+                    if a.scheduled_time and b.scheduled_time:
+                        if abs(self._to_minutes(a.scheduled_time) - self._to_minutes(b.scheduled_time)) < 30:
+                            reports.append(ConflictReport(
+                                task_id=a.id,
+                                conflict_type="time_proximity",
+                                conflicting_task_id=b.id,
+                                message=(
+                                    f"'{a.task_type}' @ {a.scheduled_time} and "
+                                    f"'{b.task_type}' @ {b.scheduled_time} overlap "
+                                    f"within 30 min on {a.scheduled_date}."
+                                ),
+                            ))
+                            seen_pairs.add(pair)
+
+            # Rule C — overload
+            if len(group) > 6:
+                reports.append(ConflictReport(
+                    task_id=group[0].id,
+                    conflict_type="daily_overload",
+                    conflicting_task_id=None,
+                    message=(
+                        f"{len(group)} tasks scheduled on {group[0].scheduled_date} "
+                        f"for the same pet — may be unmanageable."
+                    ),
+                ))
+
+        # Rule D — exact same time on the same day, different pets
+        by_time: dict = defaultdict(list)
+        for t in pending:
+            if t.scheduled_time:
+                by_time[(t.scheduled_date, t.scheduled_time)].append(t)
+
+        for (day, time_str), group in by_time.items():
+            for i, a in enumerate(group):
+                for b in group[i + 1:]:
+                    if a.pet_id == b.pet_id:
+                        continue  # already covered by same-pet rules above
+                    pair = frozenset({a.id, b.id})
+                    if pair in seen_pairs:
+                        continue
+                    reports.append(ConflictReport(
+                        task_id=a.id,
+                        conflict_type="cross_pet_time_clash",
+                        conflicting_task_id=b.id,
+                        message=(
+                            f"'{a.task_type}' and '{b.task_type}' for different pets "
+                            f"both scheduled at {time_str} on {day}."
+                        ),
+                    ))
+                    seen_pairs.add(pair)
+
+        return reports
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    def _get_or_raise(self, task_id: str) -> ScheduledTask:
+        if task_id not in self._tasks:
+            raise ValueError(f"Task '{task_id}' not found")
+        return self._tasks[task_id]
+
+    def _spawn_next(self, task: ScheduledTask) -> ScheduledTask:
+        """Create the next occurrence of a recurring task."""
+        interval = self._recurrence_interval(task)
+        return self.create(
+            pet_id=task.pet_id,
+            task_type=task.task_type,
+            scheduled_date=task.scheduled_date + timedelta(days=interval),
+            scheduled_time=task.scheduled_time,
+            recurrence=task.recurrence,
+            recurrence_interval_days=task.recurrence_interval_days,
+            notes=task.notes,
+            parent_task_id=task.id,
+        )
+
+    @staticmethod
+    def _recurrence_interval(task: ScheduledTask) -> int:
+        if task.recurrence == "daily":
+            return 1
+        if task.recurrence == "weekly":
+            return 7
+        if task.recurrence == "custom":
+            return max(1, task.recurrence_interval_days)
+        return 0
+
+    @staticmethod
+    def _to_minutes(time_str: str) -> int:
+        """Convert 'HH:MM' string to total minutes since midnight."""
+        h, m = time_str.split(":")
+        return int(h) * 60 + int(m)
